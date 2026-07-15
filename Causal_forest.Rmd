@@ -2,8 +2,10 @@
 title: "Causal Forests for inspecting the heterogeneous effects of interventions on
   pro-climate behaviour"
 output:
-  pdf_document: default
+  html_document:
+    df_print: paged
   html_notebook: default
+  pdf_document: default
 ---
 
 ## Preprocessing
@@ -19,12 +21,28 @@ library(tidyr)
 
 df <- read.csv("clean2.csv")
 
+
+df$Share[df$Share == 2] <- NA
+df$Gender[df$Gender == 3] <- NA
+df$Education.2[df$Education.2 == 2] <- NA
+df$Income[df$Income == 9] <- NA
+
+df <- na.omit(df)
+
+df <- df %>%
+  rename(
+    Education = Education.2,
+    Politics = Politics2_1,
+    SES = MacArthur_SES,
+    Country = country
+  )
+
 ```
 
 We can change this to the following different outcomes: `belief_avg, WEPT_max, policy_avg, Share`
 
 ```{r}
-Y <- df$policy_avg #change this as needed
+Y <- df$Share #change this as needed
 
 ```
 
@@ -32,8 +50,8 @@ Now we define our covariates as well as the different interventions utilised (in
 
 ```{r}
 
-covar_raw <- c("Age", "Gender", "Education.2", "Politics2_1",
-               "Income", "MacArthur_SES", "country")
+covar_raw <- c("Age", "Gender", "Education", "Politics",
+               "Income", "SES", "Country")
 
 W <- as.factor(df$condName) # Interventions
 
@@ -51,10 +69,10 @@ for (col in names(covars)) {
 }
 # Vectorize categorical covariates (Gender, country) into integer codes
 covars$Gender[is.na(covars$Gender) | covars$Gender == ""] <- "Missing"
-covars$country[is.na(covars$country) | covars$country == ""] <- "Missing"
+covars$Country[is.na(covars$Country) | covars$Country == ""] <- "Missing"
 
 covars$Gender  <- as.integer(factor(covars$Gender))  - 1
-covars$country <- as.integer(factor(covars$country)) - 1
+covars$Country <- as.integer(factor(covars$Country)) - 1
 X <- as.matrix(covars)
 
 
@@ -83,23 +101,80 @@ We can evaluate the performance of our model using two checks
 
 ```{r}
 set.seed(123)
-
 train <- sample(
   1:nrow(X),
   0.8*nrow(X)
 )
-
 forest_train <- multi_arm_causal_forest(
   X = X[train,],
   Y = Y[train],
   W = W[train],
-  num.trees = 2000
+  num.trees = 1000
 )
-
 pred_test <- predict(
   forest_train,
   X[-train,]
 )
+
+############################################################
+# Check 1: Covariate mean differences between train/test
+# (sanity check that the split didn't accidentally create
+# imbalanced samples - should all be small/non-significant
+# since this is a random split)
+############################################################
+covariate_names <- colnames(X)
+
+balance_check <- data.frame(
+  covariate   = covariate_names,
+  mean_train  = colMeans(X[train, , drop = FALSE], na.rm = TRUE),
+  mean_test   = colMeans(X[-train, , drop = FALSE], na.rm = TRUE)
+)
+balance_check$mean_diff <- balance_check$mean_train - balance_check$mean_test
+
+# Add a simple t-test p-value per covariate
+balance_check$p_value <- sapply(covariate_names, function(cn) {
+  t.test(X[train, cn], X[-train, cn])$p.value
+})
+
+print(balance_check)
+cat("\nFlagged (p < 0.05, unexpected for a random split):\n")
+print(balance_check[balance_check$p_value < 0.05, ])
+
+############################################################
+# Check 2: MSE between predicted and actual treatment effects
+#
+# Individual-level CATEs aren't directly observable (only one
+# potential outcome is observed per person), so "actual" here
+# is the OBSERVED average effect per arm in the test set
+# (mean(Y | W = arm) - mean(Y | W = Control)), compared against
+# the forest's PREDICTED average effect per arm on the same
+# test units. This is the standard practical validity check.
+############################################################
+arm_names <- dimnames(pred_test$predictions)[[2]]
+arm_names <- gsub(" - .*$", "", arm_names)
+Y_test <- Y[-train]
+W_test <- W[-train]
+
+actual_effect <- sapply(arm_names, function(arm) {
+  mean(Y_test[W_test == arm], na.rm = TRUE) -
+    mean(Y_test[W_test == "Control"], na.rm = TRUE)
+})
+
+predicted_effect <- apply(pred_test$predictions[, , 1], 2, mean, na.rm = TRUE)
+
+effect_comparison <- data.frame(
+  arm              = arm_names,
+  actual_effect    = actual_effect,
+  predicted_effect = predicted_effect
+)
+effect_comparison$sq_error <- (effect_comparison$actual_effect -
+                                  effect_comparison$predicted_effect)^2
+
+print(effect_comparison)
+
+mse_arm_level <- mean(effect_comparison$sq_error, na.rm = TRUE)
+cat("\nArm-level MSE (predicted vs. actual average effect):", mse_arm_level, "\n")
+
 ```
 
 
@@ -136,43 +211,72 @@ ggplot(importance_df,
 
 ```{r}
 
+############################################################
+# Subgroup analysis for Age (binned)
+############################################################
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
 interventions <- dimnames(tau)[[2]]
-interventions
 
 cate_df <- data.frame(
   Age = df$Age,
   tau
 )
-
 colnames(cate_df)[-1] <- gsub(" - ", "", interventions)
+
+# Bin Age into groups - adjust breaks to taste
+cate_df <- cate_df %>%
+  mutate(
+    Age_bin = cut(
+      Age,
+      breaks = c(0, 18, 25, 35, 45, 55, 65, Inf),
+      labels = c("<18", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"),
+      right = FALSE
+    )
+  )
 
 cate_long <- cate_df %>%
   pivot_longer(
-    cols = -Age,
+    cols = -c(Age, Age_bin),
     names_to = "Intervention",
     values_to = "Effect"
   ) %>%
   filter(
-    is.finite(Age),
+    !is.na(Age_bin),
     is.finite(Effect)
   )
 
-ggplot(cate_long, aes(Age, Effect, colour = Intervention)) +
-  geom_smooth(
-    method = "loess",
-    se = FALSE
+# Summarise: mean + SE of CATE per bin, per intervention
+cate_summary <- cate_long %>%
+  group_by(Intervention, Age_bin) %>%
+  summarise(
+    mean_effect = mean(Effect),
+    se = sd(Effect) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(cate_summary, aes(x = Age_bin, y = mean_effect, colour = Intervention, group = Intervention)) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  geom_pointrange(
+    aes(ymin = mean_effect - 1.96 * se, ymax = mean_effect + 1.96 * se),
+    position = position_dodge(width = 0.3),
+    size = 0.3
   ) +
   theme_minimal() +
   labs(
-    x = "Age",
-    y = "Estimated treatment effect"
+    x = "Age group",
+    y = "Estimated treatment effect",
+    title = "Treatment effect by age group"
   )
 
 ```
 ## How do the interventions effect subgroups of different Education levels?
 
 ```{r}
-ordinal_var <- "Education.2"   # swap for "Income", "MacArthur_SES", etc.
+ordinal_var <- "Education"  
 
 cate_df <- data.frame(
   ordvar = df[[ordinal_var]],
@@ -213,7 +317,7 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
   labs(
     x = ordinal_var,
     y = "Estimated treatment effect",
-    title = paste("Treatment effect by", ordinal_var)
+    title = paste("Treatment effect by Education")
   )
 ```
 
@@ -269,13 +373,24 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
 ## How do the interventions effect subgroups on the Political spectrum?
 
 ```{r}
-ordinal_var <- "Politics2_1"
+ordinal_var <- "Politics"
 
 cate_df <- data.frame(
   ordvar = df[[ordinal_var]],
   tau
 )
 colnames(cate_df)[-1] <- gsub(" - ", "", interventions)
+
+# Bin the 0-100 slider into a handful of ordered groups
+cate_df <- cate_df %>%
+  mutate(
+    ordvar = cut(
+      ordvar,
+      breaks = c(-Inf, 20, 40, 60, 80, Inf),
+      labels = c("1", "2", "3", "4", "5"),  # placeholder levels, relabeled below
+      ordered_result = TRUE
+    )
+  )
 
 cate_long <- cate_df %>%
   pivot_longer(
@@ -284,10 +399,9 @@ cate_long <- cate_df %>%
     values_to = "Effect"
   ) %>%
   filter(
-    is.finite(ordvar),
+    !is.na(ordvar),
     is.finite(Effect)
-  ) %>%
-  mutate(ordvar = factor(ordvar, ordered = TRUE))  # preserve level order
+  )
 
 # Summarise: mean + SE of CATE at each level, per intervention
 cate_summary <- cate_long %>%
@@ -307,10 +421,13 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
     size = 0.3
   ) +
   theme_minimal() +
+  scale_x_discrete(
+    labels = c("More liberal", "", "", "", "More conservative")
+  ) +
   labs(
-    x = ordinal_var,
+    x = "Political ideology",
     y = "Estimated treatment effect",
-    title = paste("Treatment effect by", ordinal_var)
+    title = "Treatment effect by political ideology"
   )
 ```
 
@@ -321,7 +438,7 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
 ## How do the interventions effect subgroups on different standings in society (Macarther SES)?
 
 ```{r}
-ordinal_var <- "MacArthur_SES"
+ordinal_var <- "SES"
 
 cate_df <- data.frame(
   ordvar = df[[ordinal_var]],
@@ -362,7 +479,7 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
   labs(
     x = ordinal_var,
     y = "Estimated treatment effect",
-    title = paste("Treatment effect by", ordinal_var)
+    title = paste("Treatment effect by Subjective Socioeconomic Standing")
   )
 ```
 
@@ -376,6 +493,20 @@ cate_df <- data.frame(
   Gender = df$Gender,
   tau
 )
+
+
+cate_df <- cate_df %>%
+  mutate(
+    Gender = recode(
+      as.character(Gender),
+      "1" = "Male",
+      "2" = "Female",
+      "3" = "Prefer not to say",
+      "4" = "Self-described"
+    )
+  )
+
+
 colnames(cate_df)[-1] <- gsub(" - ", "", interventions)
 
 cate_long <- cate_df %>%
