@@ -21,21 +21,31 @@ library(tidyr)
 
 df <- read.csv("clean2.csv")
 
+df <- df %>%
+  mutate(
+    politics = (Politics2_1 + Politics2_9) / 2
+  )
 
 df$Share[df$Share == 2] <- NA
 df$Gender[df$Gender == 3] <- NA
 df$Education.2[df$Education.2 == 2] <- NA
 df$Income[df$Income == 9] <- NA
-
 df <- na.omit(df)
 
 df <- df %>%
   rename(
     Education = Education.2,
-    Politics = Politics2_1,
+    Politics = politics,
     SES = MacArthur_SES,
     Country = country
   )
+
+df <- df %>% filter(condName %in% c("Control","BindingMoral","CollectAction","DynamicNorm",
+                                     "FutureSelfCont","Identity-Social-Norms-Intervention",
+                                     "Letter2Future","NegativeEmotions","PluralIgnorance",
+                                     "PsychDistance","SciConsens","SystemJust"))
+
+df$condName <- relevel(factor(df$condName), ref = "Control")
 
 ```
 
@@ -46,6 +56,29 @@ Y <- df$Share #change this as needed
 
 ```
 
+## Omnibus test
+
+```{r}
+# ############################################################
+# # Omnibus test: does condition affect Y overall?
+# ############################################################
+# 
+# # One-way ANOVA: any difference across the 12 conditions?
+# omnibus_aov <- aov(Share ~ condName, data = df)
+# summary(omnibus_aov)
+# 
+# # Equivalent via linear regression (same F-test, more detail)
+# omnibus_lm <- lm(Share ~ condName, data = df)
+# summary(omnibus_lm)        # per-arm coefficients vs. Control (reference level)
+# anova(omnibus_lm)          # omnibus F-test row
+# 
+# # If Levene's test suggests unequal variances across arms,
+# # use Welch's ANOVA instead (safer default with n this large)
+# # install.packages("car")
+# car::leveneTest(Share ~ condName, data = df)
+# oneway.test(Share ~ condName, data = df, var.equal = FALSE)
+```
+
 Now we define our covariates as well as the different interventions utilised (includes control). We vectorise our categorical variables gender and country into ordinal integers.
 
 ```{r}
@@ -54,7 +87,6 @@ covar_raw <- c("Age", "Gender", "Education", "Politics",
                "Income", "SES", "Country")
 
 W <- as.factor(df$condName) # Interventions
-
 
 
 covars <- df[, covar_raw]
@@ -80,12 +112,11 @@ X <- as.matrix(covars)
 
 ```
 
-## Training (And Evaluating) a Causal Forest
+## Training a Causal Forest
 
-We fit a multi-arm causal forest to estimate the heterogeneous effects of different climate interventions on pro-climate behaviour. Since intervention effectiveness may vary substantially between individuals depending on their characteristics, causal forests estimates conditional average treatment effects (CATEs). This allows the effect of each intervention to vary as a function of observed participant characteristics. This enables us to identify not only which interventions are most effective overall, but also which interventions are most effective for specific subgroups. 
+We fit a multi-arm causal forest to estimate the heterogeneous effects of different climate interventions on pro-climate behaviour. Since intervention effectiveness may vary substantially between individuals depending on their characteristics, causal forests estimates conditional average treatment effects (CATEs). This allows the effect of each intervention to vary as a function of observed participant characteristics. This enables us to identify not only which interventions are most effective overall, but also which interventions are most effective for specific subgroups.
 
 Participants were randomly assigned to a single intervention condition, allowing the model to compare differences in outcomes between individuals exposed to different treatments. Causal Forests allow us to identify not only which interventions are most effective overall, but also which interventions are most effective for specific subgroups. We use a multi-arm causal forest because the study includes multiple treatment conditions rather than a single binary intervention. The model estimates the expected outcome under each treatment condition and identifies how the relative effectiveness of interventions varies across individuals. Unlike conventional regression approaches, which require researchers to specify interaction terms a priori, causal forests use machine learning to detect complex and potentially non-linear relationships between participant characteristics and treatment effectiveness.
-
 
 ```{r}
 forest <- multi_arm_causal_forest(
@@ -97,10 +128,10 @@ forest <- multi_arm_causal_forest(
 )
 ```
 
-We can evaluate the performance of our model using two checks
+## Model Evaluation
 
 ```{r}
-set.seed(123)
+set.seed(12)
 train <- sample(
   1:nrow(X),
   0.8*nrow(X)
@@ -109,7 +140,7 @@ forest_train <- multi_arm_causal_forest(
   X = X[train,],
   Y = Y[train],
   W = W[train],
-  num.trees = 1000
+  num.trees = 2000
 )
 pred_test <- predict(
   forest_train,
@@ -150,6 +181,7 @@ print(balance_check[balance_check$p_value < 0.05, ])
 # the forest's PREDICTED average effect per arm on the same
 # test units. This is the standard practical validity check.
 ############################################################
+
 arm_names <- dimnames(pred_test$predictions)[[2]]
 arm_names <- gsub(" - .*$", "", arm_names)
 Y_test <- Y[-train]
@@ -177,9 +209,9 @@ cat("\nArm-level MSE (predicted vs. actual average effect):", mse_arm_level, "\n
 
 ```
 
+## Individual Treatment Effect
 
-We now compute the individual treatment effect and variable importance form the model
-
+We now compute the individual treatment effect and variable importance form the model.
 
 ```{r}
 
@@ -204,10 +236,72 @@ ggplot(importance_df,
   geom_col() +
   coord_flip() +
   theme_minimal()
+
+
 ```
 
-## How do the interventions effect subgroups of different ages?
+```{r}
+############################################################
+# Plot individual treatment effects (tau) per intervention
+############################################################
+library(dplyr)
+library(tidyr)
+library(ggplot2)
 
+interventions <- dimnames(tau)[[2]]
+
+tau_df <- as.data.frame(tau[, , 1])
+colnames(tau_df) <- gsub(" - ", "", interventions)
+
+tau_long <- tau_df %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Intervention",
+    values_to = "ITE"
+  ) %>%
+  filter(is.finite(ITE))
+
+# Option A: Density plot - shows the full distribution shape per arm
+ggplot(tau_long, aes(x = ITE, fill = Intervention)) +
+  geom_density(alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "black") +
+  theme_minimal() +
+  labs(
+    x = "Individual treatment effect",
+    y = "Density",
+    title = "Distribution of individual treatment effects by intervention"
+  )
+
+# Option B: Boxplot - easier to compare medians/spread across 11 arms at once
+ggplot(tau_long, aes(x = reorder(Intervention, ITE, FUN = median), y = ITE, fill = Intervention)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "black") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    x = "Intervention",
+    y = "Individual treatment effect",
+    title = "Individual treatment effect by intervention"
+  ) +
+  theme(legend.position = "none")
+
+# Option C: Violin plot - combines shape + spread, good middle ground
+ggplot(tau_long, aes(x = reorder(Intervention, ITE, FUN = median), y = ITE, fill = Intervention)) +
+  geom_violin() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "black") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    x = "Intervention",
+    y = "Individual treatment effect",
+    title = "Individual treatment effect by intervention"
+  ) +
+  theme(legend.position = "none")
+```
+
+## How do the interventions effect different subgroups?
+
+### Age
 
 ```{r}
 
@@ -273,7 +367,8 @@ ggplot(cate_summary, aes(x = Age_bin, y = mean_effect, colour = Intervention, gr
   )
 
 ```
-## How do the interventions effect subgroups of different Education levels?
+
+### Education levels?
 
 ```{r}
 ordinal_var <- "Education"  
@@ -321,7 +416,7 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
   )
 ```
 
-## How do the interventions effect subgroups of different Income levels?
+### Income levels
 
 ```{r}
 ordinal_var <- "Income"   
@@ -369,8 +464,7 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
   )
 ```
 
-
-## How do the interventions effect subgroups on the Political spectrum?
+### Political spectrum?
 
 ```{r}
 ordinal_var <- "Politics"
@@ -431,11 +525,7 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
   )
 ```
 
-
-
-
-
-## How do the interventions effect subgroups on different standings in society (Macarther SES)?
+### Standings in society (Macarther SES)?
 
 ```{r}
 ordinal_var <- "SES"
@@ -483,7 +573,7 @@ ggplot(cate_summary, aes(x = ordvar, y = mean_effect, colour = Intervention, gro
   )
 ```
 
-## How do the interventions effect different genders?
+### Genders
 
 ```{r}
 
@@ -546,5 +636,3 @@ ggplot(cate_summary, aes(x = Intervention, y = mean_effect, fill = factor(Gender
   ) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
-
-
